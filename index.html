@@ -2547,8 +2547,15 @@ function extractJson(rawText){
   if(fi!==-1&&la!==-1&&la>fi) clean=clean.slice(fi,la+1);
   try{ return JSON.parse(clean); }catch(e){}
 
-  // Paso 1: escapar saltos de línea/tabs/retornos de carro que quedaron
-  // literales dentro de un string (rompen el JSON aunque el texto se vea bien).
+  // Paso 1: recorrido carácter por carácter que repara las dos causas más
+  // comunes de "Unterminated string in JSON":
+  //  a) saltos de línea/tabs/retornos de carro literales dentro de un string
+  //     (rompen el JSON aunque el texto se vea bien).
+  //  b) comillas " sueltas sin escapar DENTRO del contenido de un string
+  //     (ej: la IA escribe: dijo "hola" a todos). Para distinguir una comilla
+  //     de cierre real de una comilla de contenido, miramos el siguiente
+  //     carácter no-espacio: si es : , } ] o el final del texto, es cierre
+  //     legítimo de string JSON; si no, es contenido y se escapa sola.
   let repaired='';
   let inString=false, escapeNext=false;
   for(let i=0;i<clean.length;i++){
@@ -2556,7 +2563,13 @@ function extractJson(rawText){
     if(inString){
       if(escapeNext){ repaired+=ch; escapeNext=false; continue; }
       if(ch==='\\'){ repaired+=ch; escapeNext=true; continue; }
-      if(ch==='"'){ repaired+=ch; inString=false; continue; }
+      if(ch==='"'){
+        let j=i+1;
+        while(j<clean.length && /\s/.test(clean[j])) j++;
+        const nextCh=clean[j];
+        if(nextCh===undefined||':,}]'.includes(nextCh)){ repaired+=ch; inString=false; continue; }
+        repaired+='\\"'; continue;
+      }
       if(ch==='\n'){ repaired+='\\n'; continue; }
       if(ch==='\r'){ repaired+='\\r'; continue; }
       if(ch==='\t'){ repaired+='\\t'; continue; }
