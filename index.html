@@ -323,6 +323,9 @@
   .btn-sm.danger { border-color: var(--red); color: var(--red); }
   .btn-sm.danger:hover { background: rgba(194,104,90,0.12); }
   .btn-sm.green { border-color: var(--green); color: var(--green); }
+  .btn-sm.neutral { border-color: var(--line); color: var(--muted); }
+  .btn-sm.neutral:hover { border-color: var(--gold); color: var(--gold-bright); }
+  .btn-sm:disabled { opacity: 0.5; cursor: default; pointer-events: none; }
 
   /* ── Changes list ── */
   .changes-list { margin-top: 14px; }
@@ -746,6 +749,10 @@
   .apikey-status.ok .dot-status { background: var(--green); }
   .apikey-status.none .dot-status { background: var(--muted); }
   .apikey-status.saved .dot-status { background: var(--gold); }
+  .apikey-status.error .dot-status { background: var(--red); }
+  .apikey-status.error { color: var(--red); }
+  .apikey-status.testing .dot-status { background: var(--gold); animation: apikeyPulse 0.9s ease-in-out infinite; }
+  @keyframes apikeyPulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
   .apikey-btns { display: flex; gap: 7px; margin-top: 10px; }
   .apikey-info { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 13px; color: var(--muted); line-height: 1.6; margin-top: 10px; }
   .apikey-info a { color: var(--gold); text-decoration: none; }
@@ -2382,37 +2389,157 @@ function getUserProfileContext(){
 // ─── API Key ──────────────────────────────────────────────────────────────────
 let userApiKey='';
 async function loadApiKey(){
+  cfgLoad();
   try{
-    if(window.storage){const r=await window.storage.get(APIKEY_KEY).catch(()=>null);if(r&&r.value)userApiKey=r.value;}
+    if(window.storage){const r=await window.storage.get(CFG_STORAGE_KEY).catch(()=>null);if(r&&r.value){Object.assign(CFG,JSON.parse(r.value));userApiKey=CFG.claude;}}
   }catch(e){}
-  // Also check localStorage as fallback for non-artifact environments
-  try{const lk=localStorage.getItem(APIKEY_KEY);if(lk)userApiKey=lk;}catch(e){}
 }
 function saveApiKey(key){
-  userApiKey=key.trim();
-  try{if(window.storage)window.storage.set(APIKEY_KEY,userApiKey).catch(()=>{});}catch(e){}
-  try{localStorage.setItem(APIKEY_KEY,userApiKey);}catch(e){}
+  CFG.claude=key.trim(); userApiKey=CFG.claude;
+  cfgSaveLocal();
+  try{if(window.storage)window.storage.set(CFG_STORAGE_KEY,JSON.stringify(CFG)).catch(()=>{});}catch(e){}
 }
 function clearApiKey(){
-  userApiKey='';
-  try{if(window.storage)window.storage.delete(APIKEY_KEY).catch(()=>{});}catch(e){}
-  try{localStorage.removeItem(APIKEY_KEY);}catch(e){}
+  CFG.claude=''; userApiKey='';
+  cfgSaveLocal();
+  try{if(window.storage)window.storage.set(CFG_STORAGE_KEY,JSON.stringify(CFG)).catch(()=>{});}catch(e){}
 }
+function saveProviderKey(provider,key){
+  CFG[provider]=(key||'').trim();
+  if(provider==='claude') userApiKey=CFG.claude;
+  cfgSaveLocal();
+  try{if(window.storage)window.storage.set(CFG_STORAGE_KEY,JSON.stringify(CFG)).catch(()=>{});}catch(e){}
+}
+function clearProviderKey(provider){ saveProviderKey(provider,''); }
 // Detect if running inside Claude.ai artifact proxy (no key needed)
 function isClaudeArtifact(){ return !!(window.__CLAUDE_ARTIFACT__ || (typeof window.storage!=='undefined')); }
 
-// ─── API ─────────────────────────────────────────────────────────────────────
-function getHeaders(){
-  const h={'Content-Type':'application/json','anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'};
-  if(userApiKey) h['x-api-key']=userApiKey;
-  return h;
+// ═══════════════════════════════════════════════════════════════════════════
+// ── CONFIGURACIÓN MULTI-IA (Claude / Gemini / ChatGPT / Grok con fallback) ──
+// ═══════════════════════════════════════════════════════════════════════════
+const CFG_STORAGE_KEY='avapro_cfg';
+const CFG={claude:'',gemini:'',chatgpt:'',grok:''};
+function cfgLoad(){
+  try{const c=localStorage.getItem(CFG_STORAGE_KEY); if(c) Object.assign(CFG,JSON.parse(c));}catch(e){}
+  try{
+    if(!CFG.claude){
+      const legacy = localStorage.getItem(APIKEY_KEY) || localStorage.getItem('nexus_api_key');
+      if(legacy){ CFG.claude = legacy; cfgSaveLocal(); }
+    }
+  }catch(e){}
+  userApiKey = CFG.claude; // compatibilidad con código existente que lee userApiKey
 }
+function cfgSaveLocal(){ try{ localStorage.setItem(CFG_STORAGE_KEY, JSON.stringify(CFG)); }catch(e){} }
+
+const API_KEY_RULES={
+  claude:  v=>v.trim().length>0,
+  gemini:  v=>v.trim().length>0,
+  chatgpt: v=>v.trim().length>0,
+  grok:    v=>v.trim().length>0,
+};
+function cfgValidateKey(provider,value){ if(!value) return null; const r=API_KEY_RULES[provider]; return r?r(value):true; }
+
+const CLAUDE_MODELS=['claude-sonnet-5','claude-haiku-4-5-20251001'];
+const GEMINI_MODELS=['gemini-2.5-flash','gemini-2.0-flash'];
+const CHATGPT_MODELS=['gpt-4o-mini','gpt-4.1-mini','gpt-3.5-turbo'];
+const GROK_MODELS=['grok-3-mini','grok-2-latest','grok-beta'];
+
+async function _fetchWithRetry(url,opts,maxRetries=2){
+  for(let attempt=0; attempt<=maxRetries; attempt++){
+    let res;
+    try{ res=await fetch(url,opts); }
+    catch(e){
+      if(attempt===maxRetries) return {error:'NETWORK',message:'Error de red'};
+      await new Promise(r=>setTimeout(r,Math.pow(2,attempt)*5000)); continue;
+    }
+    if(res.status===429){
+      if(attempt===maxRetries) return {error:'RATE_LIMIT',message:'Límite de peticiones alcanzado'};
+      const ra=res.headers.get('Retry-After');
+      await new Promise(r=>setTimeout(r, ra?parseInt(ra)*1000:Math.pow(2,attempt)*5000));
+      continue;
+    }
+    return {res};
+  }
+}
+
+async function callClaudeAI(messages,system,opts={}){
+  if(!CFG.claude) return {error:'NO_KEY',message:'Falta la API Key de Claude'};
+  for(const model of (opts.models||CLAUDE_MODELS)){
+    const body={model,max_tokens:opts.maxTokens||1200,messages};
+    if(system) body.system=system;
+    const r=await _fetchWithRetry('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':CFG.claude,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)},opts.maxRetries);
+    if(r.error){ if(r.error==='RATE_LIMIT') continue; return r; }
+    const res=r.res;
+    if(res.status===401) return {error:'INVALID_KEY',message:'API Key de Claude inválida'};
+    if(res.status===404||res.status===429) continue;
+    if(!res.ok) return {error:'HTTP_'+res.status,message:'Error HTTP '+res.status};
+    let data; try{data=await res.json();}catch(e){return {error:'EMPTY',message:'Respuesta vacía'};}
+    const tb=(data.content||[]).find(b=>b.type==='text');
+    if(!tb||!tb.text) return {error:'EMPTY',message:'Respuesta vacía'};
+    return {ok:true,text:tb.text,label:'Claude'};
+  }
+  return {error:'NO_MODEL',message:'Ningún modelo de Claude disponible'};
+}
+
+async function callGeminiAI(messages,system,opts={}){
+  if(!CFG.gemini) return {error:'NO_KEY',message:'Falta la API Key de Gemini'};
+  const contents=messages.map(m=>({role:m.role==='assistant'?'model':'user',parts:[{text:m.content}]}));
+  for(const model of (opts.models||GEMINI_MODELS)){
+    const url=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CFG.gemini}`;
+    const body={contents,generationConfig:{maxOutputTokens:opts.maxTokens||1200}};
+    if(system) body.systemInstruction={parts:[{text:system}]};
+    const r=await _fetchWithRetry(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},opts.maxRetries);
+    if(r.error){ if(r.error==='RATE_LIMIT') continue; return r; }
+    const res=r.res;
+    if(res.status===400||res.status===403) return {error:'INVALID_KEY',message:'API Key de Gemini inválida'};
+    if(res.status===404||res.status===429) continue;
+    if(!res.ok) return {error:'HTTP_'+res.status,message:'Error HTTP '+res.status};
+    let data; try{data=await res.json();}catch(e){return {error:'EMPTY',message:'Respuesta vacía'};}
+    const text=data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if(!text) return {error:'EMPTY',message:'Respuesta vacía'};
+    return {ok:true,text,label:'Gemini'};
+  }
+  return {error:'NO_MODEL',message:'Ningún modelo de Gemini disponible'};
+}
+
+async function _callOpenAICompatibleAI(messages,system,apiKey,models,endpoint,label,opts={}){
+  if(!apiKey) return {error:'NO_KEY',message:`Falta la API Key de ${label}`};
+  const msgs=system?[{role:'system',content:system},...messages]:messages;
+  for(const model of models){
+    const r=await _fetchWithRetry(endpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+apiKey},body:JSON.stringify({model,messages:msgs,max_tokens:opts.maxTokens||1200})},opts.maxRetries);
+    if(r.error){ if(r.error==='RATE_LIMIT') continue; return r; }
+    const res=r.res;
+    if(res.status===401) return {error:'INVALID_KEY',message:`API Key de ${label} inválida`};
+    if(res.status===404||res.status===429) continue;
+    if(!res.ok) return {error:'HTTP_'+res.status,message:'Error HTTP '+res.status};
+    let data; try{data=await res.json();}catch(e){return {error:'EMPTY',message:'Respuesta vacía'};}
+    const text=data?.choices?.[0]?.message?.content;
+    if(!text) return {error:'EMPTY',message:'Respuesta vacía'};
+    return {ok:true,text,label};
+  }
+  return {error:'NO_MODEL',message:`Ningún modelo de ${label} disponible`};
+}
+const callChatGPTAI=(messages,system,opts={})=>_callOpenAICompatibleAI(messages,system,CFG.chatgpt,opts.models||CHATGPT_MODELS,'https://api.openai.com/v1/chat/completions','ChatGPT',opts);
+const callGrokAI=(messages,system,opts={})=>_callOpenAICompatibleAI(messages,system,CFG.grok,opts.models||GROK_MODELS,'https://api.x.ai/v1/chat/completions','Grok',opts);
+
+// Orquestador: intenta cada proveedor configurado en orden hasta que uno responda
+async function callAI(messages,system,opts={}){
+  const providers=[];
+  if(CFG.claude)  providers.push(()=>callClaudeAI(messages,system,opts));
+  if(CFG.gemini)  providers.push(()=>callGeminiAI(messages,system,opts));
+  if(CFG.chatgpt) providers.push(()=>callChatGPTAI(messages,system,opts));
+  if(CFG.grok)    providers.push(()=>callGrokAI(messages,system,opts));
+  if(!providers.length) return {error:'NO_KEY',message:'No hay ninguna API Key configurada. Ve a Configuración > APIs.'};
+  let last=null;
+  for(const fn of providers){ const r=await fn(); if(r.ok) return r; last=r; }
+  return last||{error:'NO_MODEL',message:'Ningún proveedor respondió'};
+}
+
+// ─── API (compatibilidad con el resto de la app) ───────────────────────────
 async function callClaude(prompt,maxTokens=1200){
-  const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:getHeaders(),body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:maxTokens,messages:[{role:'user',content:prompt}]})});
-  if(!r.ok){const e=await r.json().catch(()=>({})); throw new Error(e?.error?.message||`HTTP ${r.status}`);}
-  const data=await r.json();
-  const tb=data.content.find(b=>b.type==='text'); if(!tb) throw new Error('empty');
-  let clean=tb.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+  const r=await callAI([{role:'user',content:prompt}],null,{maxTokens});
+  if(!r.ok) throw new Error(r.message||'Error de IA');
+  let clean=r.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
   const fi=clean.indexOf('{'),la=clean.lastIndexOf('}');
   if(fi!==-1&&la!==-1) clean=clean.slice(fi,la+1);
   return JSON.parse(clean);
@@ -4916,14 +5043,7 @@ async function callClaudeAnalysis(text){
   }
 }
 Texto: """${text}"""`;
-  const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:getHeaders(),body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:10000,messages:[{role:'user',content:prompt}]})});
-  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e?.error?.message||`HTTP ${r.status}`);}
-  const data=await r.json();
-  const tb=data.content.find(b=>b.type==='text');if(!tb)throw new Error('empty');
-  let clean=tb.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
-  const fi=clean.indexOf('{'),la=clean.lastIndexOf('}');
-  if(fi!==-1&&la!==-1)clean=clean.slice(fi,la+1);
-  return JSON.parse(clean);
+  return await callClaude(prompt,10000);
 }
 
 document.getElementById('analyzeBtn').addEventListener('click',async()=>{
@@ -5528,16 +5648,9 @@ ${analysisCtx}`;
   }
 
   try{
-    const r=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:getHeaders(),
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1200,messages})
-    });
-    if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e?.error?.message||`HTTP ${r.status}`);}
-    const data=await r.json();
-    const tb=data.content.find(b=>b.type==='text');
-    const reply=tb?tb.text.trim():'Sin respuesta';
-    proChatHistory.push({role:'assistant',content:reply});
+    const r=await callAI(messages,null,{maxTokens:1200});
+    if(!r.ok) throw new Error(r.message||'Error de IA');
+    proChatHistory.push({role:'assistant',content:r.text.trim()});
   }catch(e){
     proChatHistory.push({role:'assistant',content:'❌ Error: '+e.message});
   }finally{
@@ -5939,9 +6052,9 @@ function renderLegibilidad(){ const d=currentData; if(!d||!d.ai||!d.ai.legibilid
 
 function renderSentimiento(){ const d=currentData; if(!d||!d.ai||!d.ai.sentimiento) return`<div class="card"><div class="empty-state">⚠️ Analiza un texto primero.</div></div>`; const s=d.ai.sentimiento; const pillC=s.etiqueta==='Positive'?'pos':(s.etiqueta==='Negative'?'neg':'neu'); const cc=s.etiqueta==='Positive'?'var(--green)':(s.etiqueta==='Negative'?'var(--red)':'var(--muted)'); const flow=s.flujo;const W=280,H=110; const stepX=W/(flow.length-1||1); const pts=flow.map((v,i)=>[i*stepX,H-((v+100)/200)*H]); const path=pts.map((p,i)=>(i===0?'M':'L')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' '); const area=path+` L ${pts[pts.length-1][0]} ${H} L 0 ${H} Z`; return `${statBlock()}<div class="card"><h2>Puntuación de sentimiento</h2><div class="score-row"><div class="score-circle" style="border-color:${cc};"><div class="big" style="color:${cc};">${s.score.toFixed(0)}%</div><div class="sub">${s.etiqueta}</div></div><div class="score-info"><div class="pill ${pillC}" style="margin-bottom:10px;"><span class="dot"></span>${s.etiqueta}</div><div style="font-size:14px;color:var(--muted);line-height:1.5;">${d.ai.resumen}</div></div></div><div class="bar-row"><div class="bar-top"><span>Positivo</span><span>${s.positivo_pct}%</span></div><div class="bar-bg"><div class="bar-fill pos" style="width:${s.positivo_pct}%;"></div></div></div><div class="bar-row"><div class="bar-top"><span>Neutral</span><span>${s.neutral_pct}%</span></div><div class="bar-bg"><div class="bar-fill neu" style="width:${s.neutral_pct}%;"></div></div></div><div class="bar-row"><div class="bar-top"><span>Negativo</span><span>${s.negativo_pct}%</span></div><div class="bar-bg"><div class="bar-fill neg" style="width:${s.negativo_pct}%;"></div></div></div></div><div class="card"><div class="mini-grid"><div class="mini-box"><div class="lbl">Tendencia</div><div class="val sm">${s.tendencia}</div></div><div class="mini-box"><div class="lbl">Intensidad</div><div class="val">${s.intensidad_pct}%</div></div></div></div><div class="card"><h2>Flujo de sentimiento</h2><svg class="flow-svg" viewBox="0 0 280 110"><path d="${area}" fill="rgba(143,174,107,0.15)" style="opacity:0;animation:fadeUp .6s ease .5s forwards;"/><path d="${path}" fill="none" stroke="var(--gold)" stroke-width="2" class="draw"/>${pts.map((p,i)=>`<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="var(--green)" style="animation:popIn .35s cubic-bezier(.34,1.56,.64,1) ${(0.6+i*0.05).toFixed(2)}s both;"/>`).join('')}</svg></div><div class="card"><h2>Temas clave</h2><div class="topic-tags">${s.temas_clave.map(tp=>`<div class="topic-tag">${tp}</div>`).join('')}</div></div>`; }
 
-async function loadAdvanced(){ const text=inputText.value.trim(); if(!text||advLoading)return; advLoading=true; document.getElementById('results').innerHTML=`<div class="card"><div class="loading-box"><div class="spinner"></div><p>Analizando…</p></div></div>`; const langName=getOutputLangName(); const prompt=`Analiza el texto y devuelve SOLO JSON sin markdown:\n{"keywords":[{"word":"keyword","score":1-10,"category":"topic|entity|concept|action"}],"passive_sentences":[{"original":"oración pasiva exacta","active":"versión activa"}]}\nExtrae 8-15 keywords. Detecta todas las oraciones en voz pasiva. Respuestas en ${langName}.\nTexto: """${text}"""`; try{ const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:getHeaders(),body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:3000,messages:[{role:'user',content:prompt}]})}); if(!r.ok)throw new Error(''); const data=await r.json(); const tb=data.content.find(b=>b.type==='text'); if(!tb)throw new Error(''); let clean=tb.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim(); advData=JSON.parse(clean); }catch(e){advData={keywords:[],passive_sentences:[],error:true};} finally{advLoading=false;document.getElementById('results').innerHTML=renderAvanzadoHtml()+renderProChat();attachAvanzadoHandlers();attachProChatHandlers();} }
+async function loadAdvanced(){ const text=inputText.value.trim(); if(!text||advLoading)return; advLoading=true; document.getElementById('results').innerHTML=`<div class="card"><div class="loading-box"><div class="spinner"></div><p>Analizando…</p></div></div>`; const langName=getOutputLangName(); const prompt=`Analiza el texto y devuelve SOLO JSON sin markdown:\n{"keywords":[{"word":"keyword","score":1-10,"category":"topic|entity|concept|action"}],"passive_sentences":[{"original":"oración pasiva exacta","active":"versión activa"}]}\nExtrae 8-15 keywords. Detecta todas las oraciones en voz pasiva. Respuestas en ${langName}.\nTexto: """${text}"""`; try{ advData=await callClaude(prompt,3000); }catch(e){advData={keywords:[],passive_sentences:[],error:true};} finally{advLoading=false;document.getElementById('results').innerHTML=renderAvanzadoHtml()+renderProChat();attachAvanzadoHandlers();attachProChatHandlers();} }
 
-async function convertPassive(){ const text=inputText.value.trim(); if(!text)return; const btn=document.getElementById('convertPassiveBtn'); btn.textContent='Convirtiendo…';btn.disabled=true; const langName=getOutputLangName(); const detected=(advData&&advData.passive_sentences)||[]; const detectedList=detected.length?detected.map(function(p,i){return(i+1)+'. "'+p.original+'"';}).join('\n'):''; const prompt=`Reescribe el texto completo convirtiendo TODAS las oraciones en voz pasiva a voz activa, manteniendo tono e idioma. No omitas ninguna parte del texto original: el resultado debe tener la misma longitud e información, solo con las oraciones pasivas corregidas.\n${detectedList?'Estas oraciones pasivas ya fueron detectadas previamente y DEBEN quedar en voz activa en el resultado final:\n'+detectedList+'\n':''}\nDevuelve SOLO este JSON, sin texto adicional ni markdown:\n{"texto_mejorado":"texto completo reescrito, mismo largo aproximado que el original","cambios":["cambios en ${langName}"]}\nTexto original: """${text}"""`; try{ const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:getHeaders(),body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})}); if(!r.ok)throw new Error(''); const data=await r.json(); const tb=data.content.find(b=>b.type==='text'); if(!tb)throw new Error(''); let clean=tb.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim(); const parsed=JSON.parse(clean); if(!parsed||!parsed.texto_mejorado)throw new Error(''); passiveConverted=parsed; }catch(e){passiveConverted={texto_mejorado:text,cambios:['⚠️ No se pudo completar la conversión automática (respuesta incompleta). Se muestra tu texto original sin cambios — intenta de nuevo.'],error:true}; } finally{document.getElementById('results').innerHTML=renderAvanzadoHtml();attachAvanzadoHandlers();} }
+async function convertPassive(){ const text=inputText.value.trim(); if(!text)return; const btn=document.getElementById('convertPassiveBtn'); btn.textContent='Convirtiendo…';btn.disabled=true; const langName=getOutputLangName(); const detected=(advData&&advData.passive_sentences)||[]; const detectedList=detected.length?detected.map(function(p,i){return(i+1)+'. "'+p.original+'"';}).join('\n'):''; const prompt=`Reescribe el texto completo convirtiendo TODAS las oraciones en voz pasiva a voz activa, manteniendo tono e idioma. No omitas ninguna parte del texto original: el resultado debe tener la misma longitud e información, solo con las oraciones pasivas corregidas.\n${detectedList?'Estas oraciones pasivas ya fueron detectadas previamente y DEBEN quedar en voz activa en el resultado final:\n'+detectedList+'\n':''}\nDevuelve SOLO este JSON, sin texto adicional ni markdown:\n{"texto_mejorado":"texto completo reescrito, mismo largo aproximado que el original","cambios":["cambios en ${langName}"]}\nTexto original: """${text}"""`; try{ const parsed=await callClaude(prompt,4000); if(!parsed||!parsed.texto_mejorado)throw new Error(''); passiveConverted=parsed; }catch(e){passiveConverted={texto_mejorado:text,cambios:['⚠️ No se pudo completar la conversión automática (respuesta incompleta). Se muestra tu texto original sin cambios — intenta de nuevo.'],error:true}; } finally{document.getElementById('results').innerHTML=renderAvanzadoHtml();attachAvanzadoHandlers();} }
 
 function renderPassiveCards(ps){ if(!ps||ps.length===0)return`<div class="passive-no-issues"><div class="check-icon">✅</div><div><div class="check-text">¡Sin voz pasiva detectada!</div><div class="check-sub">Tu texto usa voz activa correctamente.</div></div></div>`; const cards=ps.map((p,i)=>`<div class="passive-card" id="pc_${i}"><div class="passive-header" data-idx="${i}"><span class="passive-badge">⚠️ Pasiva</span><span class="passive-sentence-preview">${escHtml(p.original.slice(0,60)+(p.original.length>60?'…':''))}</span><span class="passive-toggle">▼</span></div><div class="passive-body"><div class="passive-label"><span class="label-icon">🔴</span>Original (pasiva)</div><div class="passive-original-text">${escHtml(p.original)}</div><div class="passive-label"><span class="label-icon">🟢</span>Versión activa</div><div class="passive-active-text">✅ ${escHtml(p.active)}</div><div class="passive-action-row"><button class="passive-copy-btn" data-text="${escAttr(p.active)}" id="pcopy_${i}">📋 Copiar versión activa</button></div></div></div>`).join(''); return`<div class="passive-count-row"><div class="passive-count-icon">⚠️</div><div class="passive-count-info"><div class="passive-count-num">${ps.length}</div><div class="passive-count-label">oraciones en voz pasiva</div></div></div>${cards}<button class="analyze-btn" id="convertPassiveBtn" style="margin-top:8px;">✨ Convertir todo a voz activa</button>`; }
 
@@ -6039,15 +6152,9 @@ Lista concreta de acciones a ejecutar, en orden de prioridad.
 Sé directo, específico y práctico. No uses frases genéricas. Basa cada afirmación en los datos reales del análisis. IMPORTANTE: completa TODAS las secciones sin excepción — nunca cortes el informe a la mitad ni lo dejes incompleto. Si el espacio es limitado, reduce el detalle de cada sección pero asegúrate de que todas aparezcan y tengan cierre.`;
 
   try{
-    const r=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:getHeaders(),
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})
-    });
-    if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e?.error?.message||`HTTP ${r.status}`);}
-    const data=await r.json();
-    const tb=data.content.find(b=>b.type==='text');
-    proReportText=tb?tb.text.trim():'Sin respuesta';
+    const r=await callAI([{role:'user',content:prompt}],null,{maxTokens:4000});
+    if(!r.ok) throw new Error(r.message||'Error de IA');
+    proReportText=r.text.trim();
   }catch(e){
     proReportText='❌ Error al generar el informe: '+e.message;
   }finally{
@@ -6064,11 +6171,9 @@ async function summarizeProReport(){
   const langName=getOutputLangName();
   const prompt=`Eres un asistente experto. A continuación tienes un informe ejecutivo de análisis de texto. Genera un RESUMEN CONCISO en ${langName} con los puntos más importantes: conclusiones clave, alertas principales y próximos pasos prioritarios. Sé directo y breve (máximo 30% de la longitud original). Usa el mismo formato de secciones con ## encabezados y viñetas.\n\nINFORME ORIGINAL:\n${proReportText}`;
   try{
-    const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:getHeaders(),body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1500,messages:[{role:'user',content:prompt}]})});
-    if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e?.error?.message||`HTTP ${r.status}`);}
-    const data=await r.json();
-    const tb=data.content.find(b=>b.type==='text');
-    const summaryText=tb?tb.text.trim():'Sin respuesta';
+    const r=await callAI([{role:'user',content:prompt}],null,{maxTokens:1500});
+    if(!r.ok) throw new Error(r.message||'Error de IA');
+    const summaryText=r.text.trim();
     const body=document.getElementById('proReportBody');
     if(body){
       body.innerHTML='<div style="background:var(--purple-dim);border:1px solid rgba(16,185,129,0.3);border-radius:10px;padding:12px 14px;margin-bottom:12px;font-size:12px;color:var(--purple-bright);display:flex;align-items:center;gap:7px;"><span>✦</span><span>Resumen generado — <button id="proSumRestoreBtn" style="background:none;border:none;color:var(--gold);cursor:pointer;font-size:12px;text-decoration:underline;padding:0;">Ver informe completo</button></span></div>'+formatProReport(summaryText);
@@ -6168,48 +6273,151 @@ function escAttr(str){return String(str).replace(/"/g,'&quot;').replace(/'/g,'&#
 
 // ─── Otro Idioma Modal eliminado — japonés y coreano agregados directamente ──
 
-// ─── API Key UI helpers ───────────────────────────────────────────────────────
-function updateApiKeyStatus(){
-  const statusEl=document.getElementById('apikeyStatus');
-  const textEl=document.getElementById('apikeyStatusText');
-  const inp=document.getElementById('apikeyInput');
+// ─── API Keys UI helpers (multi-proveedor) ────────────────────────────────────
+const AI_PROVIDERS_META=[
+  {id:'claude',  label:'Claude (Anthropic)', placeholder:'sk-ant-api03-…', help:'console.anthropic.com/settings/keys'},
+  {id:'gemini',  label:'Gemini (Google)',    placeholder:'AIza…',         help:'aistudio.google.com/apikey'},
+  {id:'chatgpt', label:'ChatGPT (OpenAI)',   placeholder:'sk-…',          help:'platform.openai.com/api-keys'},
+  {id:'grok',    label:'Grok (xAI)',         placeholder:'xai-…',         help:'console.x.ai'},
+];
+// Verificación REAL de conexión: llamada mínima real a cada API.
+// Un 429/cuota se reporta como "clave válida"; solo 401/403 se trata como clave inválida.
+async function testApiKeyConnection(providerId,key){
+  const testPrompt='Responde únicamente con la palabra OK.';
+  let r;
+  try{
+    if(providerId==='claude'){
+      r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+        headers:{'Content-Type':'application/json','anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true','x-api-key':key},
+        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:10,messages:[{role:'user',content:testPrompt}]})});
+    } else if(providerId==='gemini'){
+      r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({contents:[{parts:[{text:testPrompt}]}],generationConfig:{maxOutputTokens:10}})});
+    } else if(providerId==='chatgpt'){
+      r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+        body:JSON.stringify({model:'gpt-4o-mini',max_tokens:10,messages:[{role:'user',content:testPrompt}]})});
+    } else if(providerId==='grok'){
+      r=await fetch('https://api.x.ai/v1/chat/completions',{method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+        body:JSON.stringify({model:'grok-3-mini',max_tokens:10,messages:[{role:'user',content:testPrompt}]})});
+    } else { return {ok:false,message:'Proveedor desconocido'}; }
+  }catch(e){ return {ok:false,message:'No se pudo conectar (red sin conexión o bloqueo CORS del navegador)'}; }
+  if(r.status===401||r.status===403) return {ok:false,message:'Clave inválida o sin permisos (401/403)'};
+  if(r.status===429) return {ok:false,message:'Límite de solicitudes alcanzado — la clave sí es válida'};
+  if(r.status===404) return {ok:false,message:'Modelo no disponible para esta clave (404)'};
+  if(!r.ok){
+    let msg='HTTP '+r.status;
+    try{ const e=await r.json(); msg=e?.error?.message||e?.message||msg; }catch(_){}
+    if(/quota|credit|insufficient|billing/i.test(msg)) return {ok:false,message:'Sin crédito/cuota disponible — la clave sí es válida ('+msg+')'};
+    return {ok:false,message:msg};
+  }
+  return {ok:true,message:'Conexión verificada correctamente ✅'};
+}
+function updateApiKeyStatus(providerId){
+  const statusEl=document.getElementById('apikeyStatus-'+providerId);
+  const textEl=document.getElementById('apikeyStatusText-'+providerId);
+  const inp=document.getElementById('apikeyInput-'+providerId);
   if(!statusEl||!textEl||!inp)return;
-  if(userApiKey){
-    inp.value=userApiKey;
-    statusEl.className='apikey-status saved';
-    textEl.textContent='✓ Clave guardada — se usará en todas las llamadas';
+  const val=CFG[providerId];
+  if(val){
+    inp.value=val;
+    const valid=cfgValidateKey(providerId,val);
+    statusEl.className='apikey-status '+(valid?'saved':'none');
+    textEl.textContent=valid?'✓ Clave guardada — se usará en las llamadas':'⚠️ Formato de clave no reconocido';
   } else {
     inp.value='';
     statusEl.className='apikey-status none';
-    textEl.textContent='Sin clave — modo Claude.ai (usa tus tokens de cuenta)';
+    textEl.textContent='Sin clave configurada';
   }
 }
+function setProviderButtonsDisabled(p,disabled){
+  ['save','test','clear'].forEach(suffix=>{
+    const btn=document.querySelector(`[data-${suffix}="${p}"]`);
+    if(btn) btn.disabled=disabled;
+  });
+}
 function initApiKeyUI(){
-  const inp=document.getElementById('apikeyInput');
-  const eyeBtn=document.getElementById('apikeyEye');
-  const saveBtn=document.getElementById('apikeySave');
-  const clearBtn=document.getElementById('apikeyClear');
-  if(!inp)return;
-  eyeBtn.addEventListener('click',()=>{
-    const hidden=inp.type==='password';
-    inp.type=hidden?'text':'password';
-    eyeBtn.textContent=hidden?'🙈':'👁';
+  const list=document.getElementById('apiProvidersList');
+  if(!list)return;
+  list.innerHTML=AI_PROVIDERS_META.map(p=>`
+    <div style="margin-bottom:18px;">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px;">${p.label}</div>
+      <div class="apikey-wrap">
+        <input class="apikey-input" type="password" id="apikeyInput-${p.id}" placeholder="${p.placeholder}" autocomplete="off" spellcheck="false">
+        <button class="apikey-eye" id="apikeyEye-${p.id}" type="button" title="Mostrar/ocultar">👁</button>
+      </div>
+      <div class="apikey-status none" id="apikeyStatus-${p.id}">
+        <span class="dot-status"></span>
+        <span id="apikeyStatusText-${p.id}">Sin clave configurada</span>
+      </div>
+      <div class="apikey-btns">
+        <button class="btn-sm green" data-save="${p.id}" type="button">💾 Guardar y verificar</button>
+        <button class="btn-sm neutral" data-test="${p.id}" type="button">🧪 Probar clave</button>
+        <button class="btn-sm danger" data-clear="${p.id}" type="button">🗑 Borrar</button>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Obtén tu clave en <strong>${p.help}</strong></div>
+    </div>
+  `).join('');
+  AI_PROVIDERS_META.forEach(p=>{
+    const inp=document.getElementById('apikeyInput-'+p.id);
+    const eyeBtn=document.getElementById('apikeyEye-'+p.id);
+    eyeBtn.addEventListener('click',()=>{
+      const hidden=inp.type==='password';
+      inp.type=hidden?'text':'password';
+      eyeBtn.textContent=hidden?'🙈':'👁';
+    });
+    list.querySelector(`[data-save="${p.id}"]`).addEventListener('click',async ()=>{
+      const val=inp.value.trim();
+      if(!val){showToast('Ingresa una API key primero');return;}
+      const valid=cfgValidateKey(p.id,val);
+      if(!valid){showToast('⚠️ Formato de clave no reconocido para '+p.label);}
+      saveProviderKey(p.id,val);
+      updateApiKeyStatus(p.id);
+      showToast('✓ API Key de '+p.label+' guardada, verificando conexión…');
+      setProviderButtonsDisabled(p.id,true);
+      const statusEl=document.getElementById('apikeyStatus-'+p.id), textEl=document.getElementById('apikeyStatusText-'+p.id);
+      if(statusEl) statusEl.className='apikey-status testing';
+      if(textEl) textEl.textContent='🔄 Guardando y verificando conexión…';
+      const result=await testApiKeyConnection(p.id,val);
+      setProviderButtonsDisabled(p.id,false);
+      if(result.ok){
+        if(statusEl) statusEl.className='apikey-status ok';
+        if(textEl) textEl.textContent='✓ Guardada y conectada correctamente';
+        showToast(`✓ Clave de ${p.label} guardada y verificada`);
+      } else {
+        if(statusEl) statusEl.className='apikey-status error';
+        if(textEl) textEl.textContent='✗ Guardada, pero la conexión falló: '+result.message;
+        showToast(`⚠️ Clave de ${p.label} guardada, pero la conexión falló`);
+      }
+    });
+    list.querySelector(`[data-test="${p.id}"]`).addEventListener('click',async ()=>{
+      const val=inp.value.trim()||CFG[p.id];
+      if(!val){showToast('Ingresa una API key primero');return;}
+      setProviderButtonsDisabled(p.id,true);
+      const statusEl=document.getElementById('apikeyStatus-'+p.id), textEl=document.getElementById('apikeyStatusText-'+p.id);
+      if(statusEl) statusEl.className='apikey-status testing';
+      if(textEl) textEl.textContent='🔄 Verificando conexión…';
+      const result=await testApiKeyConnection(p.id,val);
+      setProviderButtonsDisabled(p.id,false);
+      if(result.ok){
+        if(statusEl) statusEl.className='apikey-status ok';
+        if(textEl) textEl.textContent='✓ '+result.message;
+        showToast(`✓ Conexión con ${p.label} funcionando`);
+      } else {
+        if(statusEl) statusEl.className='apikey-status error';
+        if(textEl) textEl.textContent='✗ '+result.message;
+        showToast(`✗ Falló la conexión con ${p.label}`);
+      }
+    });
+    list.querySelector(`[data-clear="${p.id}"]`).addEventListener('click',()=>{
+      clearProviderKey(p.id);
+      updateApiKeyStatus(p.id);
+      showToast('Clave de '+p.label+' borrada');
+    });
+    updateApiKeyStatus(p.id);
   });
-  saveBtn.addEventListener('click',()=>{
-    const val=inp.value.trim();
-    if(!val){showToast('Ingresa una API key primero');return;}
-    if(!val.startsWith('sk-ant-')){showToast('⚠️ La clave debe empezar con sk-ant-');return;}
-    saveApiKey(val);
-    updateApiKeyStatus();
-    showToast('✓ API Key guardada');
-  });
-  clearBtn.addEventListener('click',()=>{
-    clearApiKey();
-    inp.value='';
-    updateApiKeyStatus();
-    showToast('Clave borrada');
-  });
-  updateApiKeyStatus();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6360,14 +6568,9 @@ function gcParseResult(text){
 
 // ─── GC API ──────────────────────────────────────────────────────────────────
 async function gcApiCall(messages,system){
-  const headers={"anthropic-version":"2023-06-01","Content-Type":"application/json","anthropic-dangerous-direct-browser-access":"true"};
-  if(userApiKey)headers["x-api-key"]=userApiKey;
-  const body={model:"claude-sonnet-4-6",max_tokens:1200,messages};
-  if(system)body.system=system;
-  const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers,body:JSON.stringify(body)});
-  const data=await res.json();
-  if(!res.ok)throw new Error((data.error&&data.error.message)||`Error ${res.status}`);
-  return(data.content&&data.content[0]&&data.content[0].text)||"";
+  const r=await callAI(messages,system,{maxTokens:1200});
+  if(!r.ok) throw new Error(r.message||'Error de IA');
+  return r.text||"";
 }
 
 // ─── GC build prompt ──────────────────────────────────────────────────────────
@@ -11097,29 +11300,17 @@ async function ieSendChat() {
   };
   addBubble(msg, true);
   const loadDiv = addBubble('💛 <em>Analizando tu situación…</em>', false);
-  const apiKey = localStorage.getItem('nexus_api_key');
-  const headers = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['x-api-key'] = apiKey;
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 600,
-        system: `Eres un coach de Inteligencia Emocional experto, empático y práctico. Basas tus respuestas en los modelos de Daniel Goleman, Paul Ekman, Kristin Neff y otras fuentes científicas de IE. 
+    const system = `Eres un coach de Inteligencia Emocional experto, empático y práctico. Basas tus respuestas en los modelos de Daniel Goleman, Paul Ekman, Kristin Neff y otras fuentes científicas de IE. 
 El usuario puede plantearte situaciones personales (relaciones, estrés, familia) o profesionales (ventas, clientes difíciles, rechazo, presión). 
 Responde siempre: 1) Validando su emoción o situación. 2) Dando una perspectiva de IE clara. 3) Una técnica o acción concreta y aplicable. 
-Usa un tono cálido, directo y sin tecnicismos innecesarios. Responde en español. Máximo 250 palabras.`,
-        messages: ieChatHistory.map(m => ({ role: m.role, content: m.content }))
-      })
-    });
-    const data = await resp.json();
-    const reply = data.content && data.content[0] ? data.content[0].text : 'Lo siento, hubo un error. Intenta de nuevo.';
+Usa un tono cálido, directo y sin tecnicismos innecesarios. Responde en español. Máximo 250 palabras.`;
+    const r = await callAI(ieChatHistory.map(m => ({ role: m.role, content: m.content })), system, {maxTokens:600});
+    const reply = r.ok ? r.text : (r.message || 'Lo siento, hubo un error. Intenta de nuevo.');
     loadDiv.querySelector('div').innerHTML = reply.replace(/\n/g,'<br>');
-    ieChatHistory.push({ role: 'assistant', content: reply });
+    if(r.ok) ieChatHistory.push({ role: 'assistant', content: reply });
   } catch(e) {
-    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tu API key en Configuración.';
+    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tus API Keys en Configuración.';
   }
 }
 
@@ -11546,29 +11737,17 @@ async function pnlSendChat() {
   };
   addBubble(msg, true);
   const loadDiv = addBubble('🧩 <em>Pensando…</em>', false);
-  const apiKey = localStorage.getItem('nexus_api_key');
-  const headers = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['x-api-key'] = apiKey;
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 600,
-        system: `Eres un coach experto en Programación Neurolingüística (PNL) y Neuroventas. Tienes un conocimiento profundo de los modelos de Bandler, Grinder, Robbins y Jürgen Deckert sobre neuroventas. 
+    const system = `Eres un coach experto en Programación Neurolingüística (PNL) y Neuroventas. Tienes un conocimiento profundo de los modelos de Bandler, Grinder, Robbins y Jürgen Deckert sobre neuroventas. 
 El usuario puede preguntarte sobre técnicas de PNL, sistemas representacionales (VAK), rapport, reencuadre, anclaje, lenguaje estratégico y cómo aplicar todo esto en ventas de autos, inmuebles, servicios o negocios. 
 Responde siempre: 1) Explicando el principio de PNL relevante. 2) Dando un ejemplo concreto adaptado a la situación de ventas. 3) Una frase o técnica lista para usar. 
-Tono: práctico, directo, sin tecnicismos innecesarios. Responde en español. Máximo 280 palabras.`,
-        messages: pnlChatHistory.map(m => ({ role: m.role, content: m.content }))
-      })
-    });
-    const data = await resp.json();
-    const reply = data.content && data.content[0] ? data.content[0].text : 'Lo siento, hubo un error. Intenta de nuevo.';
+Tono: práctico, directo, sin tecnicismos innecesarios. Responde en español. Máximo 280 palabras.`;
+    const r = await callAI(pnlChatHistory.map(m => ({ role: m.role, content: m.content })), system, {maxTokens:600});
+    const reply = r.ok ? r.text : (r.message || 'Lo siento, hubo un error. Intenta de nuevo.');
     loadDiv.querySelector('div').innerHTML = reply.replace(/\n/g, '<br>');
-    pnlChatHistory.push({ role: 'assistant', content: reply });
+    if(r.ok) pnlChatHistory.push({ role: 'assistant', content: reply });
   } catch (e) {
-    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tu API key en Configuración.';
+    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tus API Keys en Configuración.';
   }
 }
 
@@ -11733,24 +11912,13 @@ async function academiaChat_send(type) {
   };
   addBubble(msg, true);
   const loadDiv = addBubble(cfg.thinkingText, false);
-  const apiKey = localStorage.getItem('nexus_api_key');
-  const headers = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['x-api-key'] = apiKey;
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6', max_tokens: 600,
-        system: cfg.system,
-        messages: hist.map(m => ({ role: m.role, content: m.content }))
-      })
-    });
-    const data = await resp.json();
-    const reply = data.content && data.content[0] ? data.content[0].text : 'Lo siento, hubo un error. Intenta de nuevo.';
+    const r = await callAI(hist.map(m => ({ role: m.role, content: m.content })), cfg.system, {maxTokens:600});
+    const reply = r.ok ? r.text : (r.message || 'Lo siento, hubo un error. Intenta de nuevo.');
     loadDiv.querySelector('div').innerHTML = reply.replace(/\n/g, '<br>');
-    hist.push({ role: 'assistant', content: reply });
+    if(r.ok) hist.push({ role: 'assistant', content: reply });
   } catch (e) {
-    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tu API key en Configuración.';
+    loadDiv.querySelector('div').innerHTML = '⚠️ Error de conexión. Verifica tus API Keys en Configuración.';
   }
 }
 
@@ -11906,24 +12074,14 @@ function ieInit() {
       </div>
     </div>
     <div class="settings-section">
-      <h3>🔑 API Key de Anthropic</h3>
-      <div class="apikey-wrap">
-        <input class="apikey-input" type="password" id="apikeyInput" placeholder="sk-ant-api03-…" autocomplete="off" spellcheck="false">
-        <button class="apikey-eye" id="apikeyEye" title="Mostrar/ocultar">👁</button>
-      </div>
-      <div class="apikey-status none" id="apikeyStatus">
-        <span class="dot-status"></span>
-        <span id="apikeyStatusText">Sin clave guardada — se usa el proxy de Claude.ai</span>
-      </div>
-      <div class="apikey-btns">
-        <button class="btn-sm green" id="apikeySave">💾 Guardar clave</button>
-        <button class="btn-sm danger" id="apikeyClear">🗑 Borrar clave</button>
-      </div>
-      <div class="apikey-info">
+      <h3>🔑 APIs de IA</h3>
+      <p style="font-size:12px;color:var(--muted);margin:-4px 0 10px;">Configura una o varias. La app usa la primera disponible y pasa automáticamente a la siguiente si falla (fallback).</p>
+      <div id="apiProvidersList"></div>
+      <div class="apikey-info" style="margin-top:8px;">
         <strong>¿Cuándo necesitas una API Key?</strong><br>
-        • <strong>Dentro de Claude.ai</strong> (este chat): <em>no necesitas nada</em>, la app usa tu cuenta y tokens automáticamente.<br>
-        • <strong>Fuera de Claude.ai</strong> (archivo local, tu servidor, GitHub Pages): ingresa tu clave de <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.<br><br>
-        La clave se guarda solo en tu dispositivo y nunca se envía a ningún servidor ajeno.
+        • <strong>Dentro de Claude.ai</strong> (este chat): <em>no necesitas nada</em> para Claude, la app usa tu cuenta automáticamente.<br>
+        • <strong>Fuera de Claude.ai</strong> (archivo local, tu servidor, GitHub Pages): ingresa tus claves.<br><br>
+        Las claves se guardan solo en tu dispositivo y nunca se envían a ningún servidor ajeno.
       </div>
     </div>
     <div class="settings-section">
