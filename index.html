@@ -2535,14 +2535,90 @@ async function callAI(messages,system,opts={}){
   return last||{error:'NO_MODEL',message:'Ningún proveedor respondió'};
 }
 
+// ─── Extracción y reparación robusta de JSON proveniente de la IA ─────────────
+// Corrige las causas más comunes de "Unterminated string in JSON": respuestas
+// truncadas (falta la comilla/llave de cierre) y saltos de línea o caracteres
+// de control sin escapar dentro de un string. Nunca deja que un JSON.parse
+// directo tumbe la app: siempre intenta reparar antes de fallar.
+function extractJson(rawText){
+  let clean=String(rawText).trim();
+  clean=clean.replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+  const fi=clean.indexOf('{'),la=clean.lastIndexOf('}');
+  if(fi!==-1&&la!==-1&&la>fi) clean=clean.slice(fi,la+1);
+  try{ return JSON.parse(clean); }catch(e){}
+
+  // Paso 1: escapar saltos de línea/tabs/retornos de carro que quedaron
+  // literales dentro de un string (rompen el JSON aunque el texto se vea bien).
+  let repaired='';
+  let inString=false, escapeNext=false;
+  for(let i=0;i<clean.length;i++){
+    const ch=clean[i];
+    if(inString){
+      if(escapeNext){ repaired+=ch; escapeNext=false; continue; }
+      if(ch==='\\'){ repaired+=ch; escapeNext=true; continue; }
+      if(ch==='"'){ repaired+=ch; inString=false; continue; }
+      if(ch==='\n'){ repaired+='\\n'; continue; }
+      if(ch==='\r'){ repaired+='\\r'; continue; }
+      if(ch==='\t'){ repaired+='\\t'; continue; }
+      repaired+=ch;
+    } else {
+      if(ch==='"'){ inString=true; repaired+=ch; continue; }
+      repaired+=ch;
+    }
+  }
+  try{ return JSON.parse(repaired); }catch(e){}
+
+  // Paso 2: quitar comas colgantes antes de } o ]
+  let noTrailing=repaired.replace(/,\s*([\]}])/g,'$1');
+  try{ return JSON.parse(noTrailing); }catch(e){}
+
+  // Paso 3: respuesta truncada (se acabaron los tokens a mitad de un string
+  // o de un objeto) — cerrar comillas y llaves/corchetes abiertos.
+  let fixed=noTrailing;
+  let quoteCount=0;
+  for(let i=0;i<fixed.length;i++){ if(fixed[i]==='"'&&fixed[i-1]!=='\\') quoteCount++; }
+  if(quoteCount%2!==0) fixed+='"';
+  const opens=(fixed.match(/\{/g)||[]).length, closes=(fixed.match(/\}/g)||[]).length;
+  const opensA=(fixed.match(/\[/g)||[]).length, closesA=(fixed.match(/\]/g)||[]).length;
+  for(let i=0;i<opensA-closesA;i++) fixed+=']';
+  for(let i=0;i<opens-closes;i++) fixed+='}';
+  try{ return JSON.parse(fixed); }catch(e){}
+
+  // Paso 4: última red de seguridad. Casi todos los prompts de esta app piden
+  // el mismo esquema {"texto_mejorado":"...","cambios":[...]}. Si el JSON.parse
+  // estricto no pudo repararse (típicamente porque el texto generado trae una
+  // comilla " sin escapar en medio del contenido, lo que rompe el conteo de
+  // comillas de los pasos anteriores), extraemos los campos directamente por
+  // posición de las claves en vez de depender de un parseo JSON válido.
+  const tmKey=clean.indexOf('"texto_mejorado"');
+  if(tmKey!==-1){
+    const colonIdx=clean.indexOf(':',tmKey);
+    const startIdx=clean.indexOf('"',colonIdx)+1;
+    const cambiosKeyIdx=clean.indexOf('"cambios"',startIdx);
+    const endIdx=cambiosKeyIdx!==-1?clean.lastIndexOf('"',cambiosKeyIdx-1):clean.lastIndexOf('"');
+    if(startIdx>0&&endIdx>startIdx){
+      const unescape=s=>s.replace(/\\n/g,'\n').replace(/\\t/g,'\t').replace(/\\r/g,'\r').replace(/\\"/g,'"').replace(/\\\\/g,'\\');
+      const texto=unescape(clean.slice(startIdx,endIdx));
+      let cambios=[];
+      if(cambiosKeyIdx!==-1){
+        const arrStart=clean.indexOf('[',cambiosKeyIdx);
+        const arrEnd=clean.lastIndexOf(']');
+        if(arrStart!==-1&&arrEnd>arrStart){
+          cambios=clean.slice(arrStart+1,arrEnd).split(/",\s*"/).map(s=>unescape(s.replace(/^\s*"/,'').replace(/"\s*$/,''))).map(s=>s.trim()).filter(Boolean);
+        }
+      }
+      return {texto_mejorado:texto,cambios};
+    }
+  }
+
+  throw new Error('La IA devolvió una respuesta incompleta o mal formada. Intenta de nuevo.');
+}
+
 // ─── API (compatibilidad con el resto de la app) ───────────────────────────
 async function callClaude(prompt,maxTokens=1200){
   const r=await callAI([{role:'user',content:prompt}],null,{maxTokens});
   if(!r.ok) throw new Error(r.message||'Error de IA');
-  let clean=r.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
-  const fi=clean.indexOf('{'),la=clean.lastIndexOf('}');
-  if(fi!==-1&&la!==-1) clean=clean.slice(fi,la+1);
-  return JSON.parse(clean);
+  return extractJson(r.text);
 }
 
 // ─── Theme ───────────────────────────────────────────────────────────────────
