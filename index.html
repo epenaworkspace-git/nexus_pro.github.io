@@ -2841,15 +2841,29 @@ function showToast(msg){ const el=document.getElementById('toast'); if(!el)retur
 // SÍ sincroniza: tema, idiomas, tono por defecto, perfil (nombre/género) y un
 // historial acotado (MAX_HISTORY=5). Todo vive en un solo documento usuarios/{uid}.
 // ═══════════════════════════════════════════════════════════════════════════
-const firebaseConfig = {
-  apiKey: "AIzaSyATTrYMqivDJGLhQYDDjEqLCyv-YEMSK2A",
-  authDomain: "nexus-pro-plus.firebaseapp.com",
-  projectId: "nexus-pro-plus",
-  storageBucket: "nexus-pro-plus.firebasestorage.app",
-  messagingSenderId: "5726048688",
-  appId: "1:5726048688:web:59ac6eb9872a5932008675",
-  measurementId: "G-35P5FFYJJQ"
-};
+const firebaseConfig = (function(){
+  var LS_KEY = 'fbcfg_nexus_pro';
+  var saved = null;
+  try { saved = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch(e) { saved = null; }
+  if (saved && saved.apiKey) return saved;
+  for (var intento = 0; intento < 3; intento++) {
+    var pasted = window.prompt('Configuracion de Firebase para Nexus Pro (solo la primera vez en este dispositivo).\nPega aqui el JSON de configuracion (debe empezar con { y las comillas en los nombres de los campos):');
+    if (!pasted) break;
+    try {
+      var cfg = JSON.parse(pasted);
+      if (!cfg.apiKey) {
+        window.alert('Ese texto es JSON valido pero le falta el campo "apiKey". Revisa que copiaste el bloque completo e intenta de nuevo.');
+        continue;
+      }
+      localStorage.setItem(LS_KEY, JSON.stringify(cfg));
+      return cfg;
+    } catch(e) {
+      window.alert('El texto pegado no es un JSON valido. Debe verse asi (con comillas en TODOS los nombres de campo):\n{"apiKey":"...","authDomain":"...","projectId":"...","storageBucket":"...","messagingSenderId":"...","appId":"..."}\n\nIntenta de nuevo.');
+    }
+  }
+  window.alert('No se configuro Firebase para Nexus Pro. La app seguira funcionando localmente, sin sincronizacion, hasta que recargues la pagina y lo captures correctamente.');
+  return { apiKey:'', authDomain:'', projectId:'', storageBucket:'', messagingSenderId:'', appId:'' };
+})();
 const PREFS_KEY='avapro_prefs';
 let fbApp=null, fbAuth=null, fbDb=null, fbUser=null, fbUnsub=null;
 let fbSaveTimer=null, fbHasPendingWrite=false, fbReady=false;
@@ -3036,13 +3050,18 @@ async function fbInit(){
     fbUpdateAccountUI();
     return;
   }
+  if(!firebaseConfig || !firebaseConfig.apiKey){
+    showAuthGate();
+    gateMsg('Falta la configuración de Firebase. Recarga la página para volver a capturarla.', true);
+    return;
+  }
   try{
     fbApp=firebase.initializeApp(firebaseConfig);
     fbAuth=firebase.auth();
     fbDb=firebase.firestore();
     try{ await fbDb.enablePersistence({synchronizeTabs:true}); }catch(e){ /* varias pestañas o navegador sin soporte: seguimos sin persistencia offline */ }
     initAuthGate();
-    await gateCompleteEmailLinkIfNeeded();
+    await gateCompleteEmailLinkIfNeeded().catch(()=>{});
     fbAuth.onAuthStateChanged(async (user)=>{
       if(user){
         hideAuthGate();
@@ -3055,11 +3074,15 @@ async function fbInit(){
         fbListenUser();
         fbUpdateAccountUI();
       } else {
-        // Ya no se crea sesión anónima automática: en navegador real se exige login (Google, email+contraseña o enlace por correo)
         showAuthGate();
       }
+    }, (err)=>{
+      showAuthGate();
+      gateMsg('Error de sesión: '+(err.message||err.code||err), true);
     });
   }catch(e){
+    showAuthGate();
+    gateMsg('No se pudo inicializar Firebase: '+(e.message||e), true);
     console.warn('Firebase: no disponible en este entorno',e); fbUpdateAccountUI();
   }
 }
@@ -7756,6 +7779,7 @@ pre{white-space:pre-wrap;font-family:Arial,sans-serif;font-size:13px;background:
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',async()=>{
+  fbInit(); // se dispara primero: el login nunca debe depender de que el resto de la interfaz cargue sin errores
   loadLocalPrefs();      // preferencias guardadas en este dispositivo (tema, idiomas, tono, perfil)
   loadLocalHistoryFallback();
   initTheme();
@@ -7806,7 +7830,6 @@ document.addEventListener('DOMContentLoaded',async()=>{
   initProfileUI();
   initAccountSyncUI();
   applyPrefsToUI();
-  fbInit();
   // Inicializar en modo Ventas (comercial)
   gcRender();
   const wrapEl=document.querySelector('.wrap');
